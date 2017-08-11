@@ -23,7 +23,72 @@ def hotkey(arg):
 def bit2raw(bits):
   return int(''.join(map(str,bits)),2)
 
+class EndOfData(Exception):
+  pass
+
+class MagicReadFileBuffer(object):
+  ''' buffered file reader, allowin avoid of re-readin same data '''
+
+  def __init__(self, filename, verbose=False):
+    self.filename = filename
+    self.verbose = verbose
+    self.handle = open(filename,'rb')
+    self.buf_size = 0xF00000
+    self.pos = 0
+    self.buf_pos = 1
+    self.buf = ''
+    self.seek(0)
+    self.mark = -1
+ 
+  def _re(self):
+    self.handle.seek(self.pos)
+    self.buf = self.handle.read(self.buf_size)
+    self.buf_pos = self.pos    
+    if self.verbose:
+      print("Bufer fill {0} b".format(len(self.buf)))
+
+  def seek(self,pos):
+    self.pos = pos 
+    if pos < self.buf_pos:
+      self._re()
+    if pos > self.buf_pos + self.buf_size - 1:
+      self._re()
+
+  def set_buffer(self, size):
+    self.buf_size = size
+
+  def fix_buf_if_less_than(self, size):
+    if self.buf_size < size:
+      seifl.buf_size = size * 2 ## safety :P
+
+  def mark(self):
+    self.mark = self.pos
+
+  def tell(self):
+    return self.pos
+
+  def read(self, n):
+    buf_ptr = self.pos - self.buf_pos
+    if buf_ptr + n > self.buf_size - 1:
+      base = self.mark
+      if base == -1:
+        base = self.pos
+      self.pos = base
+      self._re()
+      buf_ptr = self.pos - self.buf_pos 
+    if n == 0:
+      return ''
+    if n == 1:
+      self.pos += 1
+      return self.buf[buf_ptr]
+    self.pos += 1
+    return self.buf[buf_ptr:buf_ptr+n]
+    
+
+
 class MasterClass(object):
+  """ namespace for main code """
+
   file_handle = None
   file_offset = None
   pix_per_row = 100
@@ -45,17 +110,20 @@ class MasterClass(object):
   put_pixel = None # func 
 
 
-  def __init__(self, filename=None, bit_per_pixel=24, skip=0, xres=800, yres=800, pix_size=1):
+  def __init__(self, filename=None, bit_per_pixel=24, skip=0, xres=800, yres=800, pix_size=1, entropy=False, verbose=False):
     self.file_name = filename
-    self.file_handle = open(filename, 'rb')
+    #self.file_handle = open(filename, 'rb')
+    self.file_handle = MagicReadFileBuffer(filename, verbose)
     self.file_offset = 0x00
+    self.calc_entropy = entropy
+    self.verbose = verbose
     if bit_per_pixel < 1:
       bit_per_pixel = 1
     self.bit_per_pixel = bit_per_pixel
     self.skip = skip
-    if xres < 100:
+    if xres < 5:
       xres = 100
-    if yres < 100:
+    if yres < 5:
       yres = 100
     self.xres = xres
     self.yres = yres
@@ -74,7 +142,6 @@ class MasterClass(object):
     if self.bit_per_pixel == 24:
         self.make_color = self._make_color_24
 
-    print self.bit_per_pixel % 8
     if self.bit_per_pixel % 8 == 0:
       self.get_next_piexl = self._get_next_8
       self.chunk_size = self.bit_per_pixel / 8
@@ -83,8 +150,8 @@ class MasterClass(object):
     self.keep_working = True
 
 
-
   def start(self):
+    """ main loop """
     while self.keep_working:
       time.sleep(0.01)
       for ev in pygame.event.get():
@@ -94,7 +161,6 @@ class MasterClass(object):
         if ev.type == pygame.KEYDOWN:
           key = ev.key
           self.kbd_state[key] = 1
-          # print "KEYPRES " ,key
         if ev.type == pygame.KEYUP:
           key = ev.key
           try:
@@ -110,7 +176,8 @@ class MasterClass(object):
 
       if self.need_redraw:
         self.the_screen.fill((0, 0, 0))
-        print "file_offset : ", self.file_offset, hex(self.file_offset)
+        if self.verbose:
+          print("> file_offset : {0} (0x{1})".format(self.file_offset, hex(self.file_offset)))
         self.update_screen()
         pygame.display.flip()
         self.need_redraw = False
@@ -195,14 +262,18 @@ class MasterClass(object):
     tmp = self.file_handle.read(self.chunk_size)
     self.file_handle.read(self.skip)
     if len(tmp) != self.chunk_size:
-      raise Exception("EOF HIT1")
+      raise EndOfData("EOF1")
+    if self.calc_entropy:
+      for c in tmp:
+        self.entropy[c] = self.entropy.get(c,0) + 1
     return self.make_color(int(tmp.encode('hex'),16))
 
   def _get_next_x(self):
     while len(self.buffer) < self.bit_per_pixel:
       one_byte = self.file_handle.read(1)
       if len(one_byte) != 1 or one_byte is None:
-        raise Exception("EOF HIT2")
+        raise EndOfData("EOF2")
+      self.entropy[one_byte] = self.entropy.get(one_byte,0) + 1
       self.buffer.extend(list(bin(ord(one_byte))[2:].rjust(8, '0')))
     tmp = self.buffer[:self.bit_per_pixel]
     self.buffer = self.buffer[self.bit_per_pixel+self.skip:]
@@ -213,25 +284,41 @@ class MasterClass(object):
     col_size = self.pix_per_row + self.x_space
     col_count = self.xres / col_size ## int rount will do the job
     t1 = time.time()
+    pos1 = self.file_handle.tell()
+    self.entropy = {}
+    fail = 0 
     try:
       for col_no in range(col_count):
         pad = col_no * col_size
         for row in range(self.yres):
           for pix_x in range(self.pix_per_row):
             self.put_pixel(pad + pix_x, row, self.get_next_piexl())  
+    except EndOfData as end:
+      if self.verbose:
+        print("End-of-data ({0}) HIT !".format(end))
     except Exception as err:
       print("Fail to render : {0}".format(str(err)))
-    dt = time.time() - t1
-    print("Rendered in {0} seconds ".format(dt))
+      fail = 1
+    if self.calc_entropy:
+      entropy = len(self.entropy) / 256.0 
+      print("Entropy = {0}".format(entropy))
+    delta_pos = self.file_handle.tell() - pos1 
+    if fail == 0 and delta_pos > 10:
+      self.step_big_vert = delta_pos  - delta_pos / 10
+    delta_t = time.time() - t1
+    if self.verbose:
+      print("Rendered {0} bytes in {1} seconds ".format(delta_pos, delta_t))
 
 def main():
-  parser = argparse.ArgumentParser(description='MVS == MEMory VIsual SEEker :-) ')
+  parser = argparse.ArgumentParser(description=' == MEMory VIsual SEEker == ')
   parser.add_argument("filename", action="store", help="Data file name")
   parser.add_argument("--bps", action="store", dest="bit_per_pixel", default=24, type=int, help="bits per pixel")
   parser.add_argument("--skip", action="store", default=0, type=int, help="Skipt N bits after pixel ... Usefull to skip alpha")
   parser.add_argument("--xres", action="store", default=800, type=int, help="GUI X-size of window (in pix_size), def=800")
   parser.add_argument("--yres", action="store", default=800, type=int, help="GUI Y-size of window (in pix_size), def=800")
   parser.add_argument("--pix-size", action="store", default=1, type=int, help="Pixel size (square), def=1")
+  parser.add_argument("--entropy", action="store_true", default=False, help="Calculate entropy of chunk displayed")
+  parser.add_argument("--verbose", action="store_true", default=False, help="Verbose mode")
   opts = parser.parse_args()
   print opts
   try:
